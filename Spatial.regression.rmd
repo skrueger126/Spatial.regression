@@ -1,0 +1,453 @@
+---
+title: "Spatial Regression Exercise"
+author: "Sarah Krueger"
+date: "11/8/2021"
+output:
+  html_document: 
+    df_print: paged
+    rows.print: 10
+    theme: cosmo
+    highlight: breezedark
+    number_sections: yes
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: yes
+  pdf_document: default
+  html_notebook:
+    df_print: paged
+    rows.print: 10
+    theme: cosmo
+    highlight: breezedark
+    number_sections: yes
+    toc: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: yes
+editor_options:
+  chunk_output_type: inline
+  mode: gfm
+---
+
+```{=html}
+<style type="text/css">
+
+h1.title {
+  font-size: 40px;
+  font-family: "Times New Roman", Times, serif;
+  color: Black;
+  text-align: center;
+}
+
+h4.author { /* Header 4 - and the author and data headers use this too  */
+  font-size: 25px;
+  font-family: "Times New Roman", Times, serif;
+  font-weight: bold;
+  color: Black;
+  text-align: center;
+}
+
+body {
+  font-family: Helvetica;
+  font-size: 12pt;
+}
+
+.zoom {
+  transform-origin: 40% 50% 0;
+  transition: transform .2s;
+  margin: 0 auto;
+}
+.zoom img{
+	width:auto;
+	height:auto;	
+}
+.zoom:hover {
+  transform: scale(2);
+}
+
+th, td {padding: 5px;}
+
+</style>
+```
+
+<body style="background-color:#bcbddc;">
+
+```{r, include = FALSE, error = FALSE, message = FALSE}
+packages<-c("biscale", "cleangeo", "cowplot", "dplyr", "geosphere", "ggplot2", "ggExtra", "maps", "maptools", "readxl", "rgdal", "rgeos", "sf", "sp", "spatialreg", "spdep", "tidyr", "viridis", "maps")
+
+sapply(packages, require, character.only=T)
+```
+
+# Dataset and Study Summary 
+
+In this exercise, I examined the effect of numerous socioeconomic factors related to percentage of children under the age of 18 who are living below the poverty line in the Southern United States.
+
+![](pics/sign.jpg)
+
+I began by reading in data provided by the U.S. Census Bureau, American Community Survey, Bureau of Labor Force Statistics, U.S. Department of Agriculture Economic Research Service, and the County Health Rankings. 
+
+Independent variables include: rural, urban, manufacturing, agriculture, retail, health care, construction, less than high school degree, unemployment, income ratio, teen birth, unmarried, single mother household, uninsured, as well as race variable like Black and Hispanic.  
+
+```{r}
+data <- read.csv('./childpov18_southfull.csv', 
+                   colClasses = c("character", "character", "character", 
+                                  "numeric", "numeric", "numeric", "numeric",
+                                  "numeric", "numeric", "numeric", "numeric",
+                                  "numeric", "numeric", "numeric", "numeric", 
+                                  "numeric", "numeric", "numeric", "numeric",
+                                  "numeric", "numeric", "numeric", "numeric",
+                                  "numeric", "numeric", "numeric", "numeric", 
+                                  "numeric", "numeric", "numeric", "numeric",
+                                  "numeric", "numeric", "numeric", "numeric"))
+
+names(data)[names(data)=="X2016.child.poverty"] <- "child.pov.2016"
+
+head(data)
+```
+
+After importing the entire dataset, I chose to include only Georgia and viewed the data to check for any errors. 
+
+```{r}
+ga_pov <- data %>% subset(State == "GA")
+
+summary(ga_pov)
+```
+
+I have a few variables with minimum values below zero, but for the purposes of this exercise, I chose to ignore then for now.
+
+# Ordinary Least Squares 
+
+I created an equation to test the relationship between child poverty and my chosen independent variables.
+
+I then ran a simple ordinary least squares. I also limited the use of scientific notation to numbers greater than 5 decimal places within the output and summaries.
+
+```{r, warning = FALSE, error = FALSE}
+equation <- child.pov.2016 ~ rural + urban + lnmanufacturing + lnag + lnretail + lnhealthss + lnconstruction + lnlesshs + lnunemployment + lnsinglemom + lnblack + lnhispanic + lnuninsured + lnincome_ratio + lnteenbirth + lnunmarried
+
+options(scipen = 5)
+
+ols <- lm(equation, data = ga_pov)
+
+summary(ols)
+```
+
+In this analysis we can see a number of significant (α=0.05) log variables including: less than high school degree, single mother households, percent of population that is black, and unmarried households. 
+
+# Spatial Regression Analysis
+
+## Creating a list of contiguity neighbors
+
+In order to determine if there were any underlying spatial relationships in my residuals I ran various tests of the data by first providing a spatial weights matrix, creating a list of neighbors, and creating a county polygon dataset containing the FIPS code in order to covert the object to a SpatialPolygons class.
+
+```{r, message = FALSE, error = FALSE}
+fips <- county.fips
+
+fips.codes <- separate(data = fips, col = polyname, into = c("state", "county"), sep = ",")
+
+ga_fips <- subset(fips.codes, state=="georgia", select=fips)
+
+georgia <- map(database = "county", regions = "georgia", fill=T, plot=F)
+
+ga_sp = map2SpatialPolygons(georgia,ga_fips$fips,CRS("+proj=longlat"))
+
+library(cleangeo)
+
+cleaned <- clgeo_Clean(ga_sp)
+
+neighb.data <- poly2nb(cleaned, queen=T)
+
+cont.neighb <- nb2listw(neighb.data,style="W", zero.policy = TRUE)
+```
+
+## Moran's Correlation
+
+I first used a Moran’s Correlation Test to examine the residuals of the OLS regression using the spatial relationship matrix. In this case the null hypothesis is that there are “no spatial correlation in the residuals”.
+
+```{r}
+library(spdep)
+lm.morantest(ols, cont.neighb)
+```
+
+When viewing the results from the Moran’s Test, I could see that I had a significant p-value of 0.04461. This means that I could reject the null hypothesis due to the detection of spatial dependency in the dataset. 
+
+This suggested I should be using a spatial model!
+
+## LaGrange Multiplier Tests
+
+Another way to analyze the data is to use a LaGrange Multiplier Test. 
+
+The function reports the estimates of simple LM tests for error dependence (LMerr), for a missing spatially lagged dependent variable (LMlag), for robust variants of these tests (RLMerr to test for error dependence in the possible presence of a missing lagged dependent variable and RLMlag the other way round), and a portmanteau test (SARMA, in fact LMerr + RLMlag). 
+
+I can run all of these at once using the following script:
+
+```{r}
+lm.LMtests(ols, cont.neighb, test="all")
+```
+
+The results of the 5 LaGrange Multiplier Tests are as follows:
+
+|LMER|LMlag|RLMerr|RLMlag|SARMA|
+|-|-|-|-|-|
+|0.2507|0.2088|0.7065|0.5262|0.4229|
+
+According to the decision tree for model selection developed by Dr. Luc Anselin, I would keep my OLS results. I continued running other models anyways.
+
+## Spatially Lagged X Model
+
+Here I examined the Spatially Lagged X Model. The SLX model accounts for the average value of neighboring X values within my model. Essentially this is a one-way interaction where potentially the neighbors have an impact, but that is the limit of the interactions. To run an SLX model I need to provide the dataset and the spatial weights matrix I created before.
+
+```{r, message = FALSE, error = FALSE}
+library(spatialreg)
+SLX.model <- spatialreg::lmSLX(equation, data=ga_pov, cont.neighb)
+summary(SLX.model)
+
+```
+
+Looking at the p-values we can see that overall the lagged variables were not significant (only two were significant), emphasizing the need for an error model. 
+
+I then used the following script to limit the results to only the p-values.
+
+```{r}
+summary(spatialreg::impacts(SLX.model, cont.neighb), zstats = TRUE)[["pzmat"]]
+```
+
+Again, there were only 3 variables that are significant in the analysis.
+
+## Spatial Lag Model 
+
+The Spatial Lag Model is a global model where the dependent variable among the neighbors influences our dependent variable. Therefore there is a feedback loop that occurs where affects on the neighbor(s) y affects the y and the neighbor(s) y variable. 
+
+```{r}
+sp.lag.model <- spatialreg::lagsarlm(equation, data=ga_pov, cont.neighb)
+summary(sp.lag.model, Nagelkerke = TRUE)
+```
+
+I can see from the p-value (0.20673) the model is NOT significant.
+
+As with the previous impacts table, I limited the results to the p-values.
+
+```{r}
+summary(spatialreg::impacts(sp.lag.model, listw = cont.neighb, R=100), zstats = TRUE)[["pzmat"]]
+```
+
+This time, I see 5 significant variables.
+
+## Spatial Error Model
+
+Next I ran the Spatial Error Model.
+
+```{r}
+sp.err.model <- spatialreg::errorsarlm(equation, data=ga_pov, cont.neighb)
+summary(sp.err.model, Nagelkerke = TRUE)
+```
+
+In the summary I see 6 significant variables this time! 
+
+### Comparing continguity models
+
+Comparing the p-values of the three 3 models, we can see that overall the Spatial Error Model provides the best fit comparatively.
+
+|SLX||Lag||Err|
+|-|-|-|
+|< 2.2e-16|0.20673|0.15976|
+
+I tested validity of the error model by running a Spatial Hausman Test to see if the results of the analysis verify the use of the model.
+
+```{r}
+spatialreg::Hausman.test(sp.err.model)
+```
+
+Based on the p-value of 0.02105 I concluded that the use of OLS or a standard error model may not be appropriate for this set of variables. Everything still looks good!
+
+### Nested Spatial Durbin Models
+
+Alternatively, I could have a nested model to explore the likelihood of which model would be appropriate for the data. A Spatial Durbin Model contains components of OLS, SLX, Spatial Lag, and Spatial Error models.
+
+The results of this model can determine if lagged y, error, or lagged x values are important in the model, or whether the model should be simplifed to include only the lagged y values (lag model), lagged x values (SLX), the errors (error model), or a simple OLS. 
+
+The Spatial Durbin Error Model contains components of OLS, SLX, and Spatial Error models. The results of this model can determine if both errors and lagged x values are important in the model, or whether the model should be simplifed to include only the lagged x values (SLX), the errors (error model), or a simple OLS.
+
+Because I already know that an error model is NOT the best, I will use the Spatial Durbin Model for this portion of the exercise.
+
+```{r}
+sdm <- spatialreg::lagsarlm(equation, ga_pov, cont.neighb, type = "mixed")
+sd.err <- spatialreg::errorsarlm(equation, ga_pov, cont.neighb, etype = "emixed")
+
+summary(sdm, Nagelkerke = TRUE)
+```
+
+```{r}
+summary(spatialreg::impacts(sdm, listw = cont.neighb, R = 100), zstats = TRUE)[["pzmat"]]
+```
+
+I obtained a high p-value (0.75881) meaning I should restrict the model to the spatially lagged X model.
+
+I then ran the likelihood ratio to make sure.
+
+```{r}
+LR.Sarlm(sd.err,sp.err.model)
+```
+
+My results are agreeing that, with a low p-value of 0.0008763, I should reject the null hypothesis. Meaning that I should NOT restrict the model to a spatial error model.
+
+## Spatial Regression Analysis, K-nearest neighbors
+
+In this example I used distance calculations to examine the relationships in my data with K-nearest neighbors. While the previous spatial regression equations used spatial weight matrices in the analysis, K-nearest neighbors allows me to fine tune the distance value to fit specific criteria. 
+
+### Creating a list of K-neighbors
+
+In this example, I started by creating centroid for a county polygons.
+
+```{r}
+all.xy <-centroid(ga_sp)
+colnames(all.xy) <- c("x","y")
+```
+
+Next, I created a neighbor list from our centroids based on a k-nearest value. For this example I examined k = 1, k = 3, and k = 5. Then I calculated the distance value so the model can create a radius to encompass the neighbors. Finally, I produced the list of neighbors within the neighborhood.
+
+```{r}
+#Create neighbors
+all.dist.k1 <- knn2nb(knearneigh(all.xy, k=1, longlat = TRUE))
+all.dist.k3 <- knn2nb(knearneigh(all.xy, k=3, longlat = TRUE))
+all.dist.k5 <- knn2nb(knearneigh(all.xy, k=5, longlat = TRUE))
+
+#Determine max k distance value to neighbor
+all.max.k1 <- max(unlist(nbdists(all.dist.k1, all.xy, longlat=TRUE)))
+all.max.k3 <- max(unlist(nbdists(all.dist.k3, all.xy, longlat=TRUE)))
+all.max.k5 <- max(unlist(nbdists(all.dist.k5, all.xy, longlat=TRUE)))
+
+#Calculate neighbors based on distance
+all.sp.dist.k1 <- dnearneigh(all.xy, d1=0, d2=1 * all.max.k1, longlat = TRUE)
+all.sp.dist.k3 <- dnearneigh(all.xy, d1=0, d2=1 * all.max.k3, longlat = TRUE)
+all.sp.dist.k5 <- dnearneigh(all.xy, d1=0, d2=1 * all.max.k5, longlat = TRUE)
+
+#Create neighbor list
+all.dist.neighb.k1 <- nb2listw(all.sp.dist.k1,style="W", zero.policy = TRUE)
+all.dist.neighb.k3 <- nb2listw(all.sp.dist.k3,style="W", zero.policy = TRUE)
+all.dist.neighb.k5 <- nb2listw(all.sp.dist.k5,style="W", zero.policy = TRUE)
+```
+
+## Distance Lag Model
+
+To calculate a distance lag model for each k-distance value I used the following:
+
+```{r}
+all.dist.lag.k1 <- spatialreg::lagsarlm(equation, data = ga_pov, listw = all.dist.neighb.k1)
+all.dist.lag.k3 <- spatialreg::lagsarlm(equation, data = ga_pov, listw = all.dist.neighb.k3)
+all.dist.lag.k5 <- spatialreg::lagsarlm(equation, data = ga_pov, listw = all.dist.neighb.k5)
+```
+
+For this example, I only summarized the first lag model.
+
+```{r}
+summary(all.dist.lag.k1, Nagelkerke = TRUE)
+```
+
+## Distance Error Model
+
+To calculate a distance error model for each k-distance value I used the following:
+
+```{r}
+all.dist.err.k1 <- spatialreg::errorsarlm(equation, data = ga_pov, listw = all.dist.neighb.k1)
+all.dist.err.k3 <- spatialreg::errorsarlm(equation, data = ga_pov, listw = all.dist.neighb.k3)
+all.dist.err.k5 <- spatialreg::errorsarlm(equation, data = ga_pov, listw = all.dist.neighb.k5)
+```
+
+Again, I only summarized the first lag model.
+
+```{r}
+summary(all.dist.err.k1, Nagelkerke = TRUE)
+```
+
+### Comparing distance models
+
+While the two models are relatively comparable, I can see that the distance error model was the best.
+
+|Lag|Err|
+|-|-|
+|0.18991|0.086954|
+
+# Mapping the Results
+
+In order to connect the poverty data to spatial data I needed to have a common column to merge the two datasets. For this example I used the FIPS codes. I created an output including variables from the original dataset as well as the analyses. For this example I used the ga_pov and all.dist.err.k1 data to create a bivariate map of variables.
+
+To create the output I complied columns from the poverty and error model dataset.
+
+```{r}
+dist.err.data <- summary(all.dist.err.k1, correlation=TRUE, Nagelkerke = TRUE)
+
+dist.err.output <- cbind.data.frame(ga_pov$FIPS,
+                                    dist.err.data$fitted.values, 
+                                    dist.err.data$residual, 
+                                    ga_pov$child.pov.2016,
+                                    ga_pov$lnunemployment,
+                                    ga_pov$lnsinglemom,
+                                    ga_pov$lnuninsured,
+                                    ga_pov$lnlesshs,
+                                    ga_pov$lnblack,
+                                    ga_pov$lnhispanic,
+                                    ga_pov$lnincome_ratio,
+                                    ga_pov$lnsevere_housing,
+                                    stringsAsFactors = FALSE)
+
+#Renaming columns
+colnames(dist.err.output) <- c("fips","fitted","resid","childpov",
+                      "unemployment","single_mom", "uninsured", "lesshs", "black","hispanic", "income_ratio", "severe_housing")
+```
+
+I then used this data to create a bivariate map. 
+
+```{r}
+library(biscale)
+
+ga_fortify <- fortify(ga_sp)
+
+ga_poly <- merge(x = ga_fortify, y = dist.err.output, 
+                 by.x = "id", by.y = "fips", all = TRUE)
+
+bivariate_data <- bi_class(ga_poly, x = childpov, y = lesshs, 
+                           dim = 3, style = "quantile")
+
+legend <- bi_legend(pal = "Brown",
+                    dim = 3,
+                    xlab = "Child Poverty",
+                    ylab = "Less than High School Degree\n Households",
+                    size = 6)
+```
+
+I then created additional datasets to serve as a basemap for my analysis.
+
+```{r}
+world <- map_data("world")
+states <- map_data("state")
+southern_states <- subset(states, region %in% 
+                            c("texas", "arkansas", "louisiana", "mississippi", 
+                              "alabama", "georgia", "florida", "north carolina",
+                              "south carolina", "tennessee", "oklahoma", 
+                              "kentucky", "west virginia", "virginia", 
+                              "maryland", "delaware", "district of columbia"))
+```
+
+I used ggplot to create the bivariate map and used the ggdraw() and draw_plot() functions in cowplot to add the legend to the final map.
+
+```{r}
+unemploy_pov_map <- ggplot() + 
+  geom_polygon(data = world, aes(x=long,y=lat, group=group), fill = "gray95", color = "white") +
+  geom_polygon(data = states, aes(x=long,y=lat, group=group), fill = "#bdbdbd", color = "white") +
+  geom_polygon(data = southern_states, aes(x=long,y=lat, group=group), fill = NA, size = 0.01, color = "white") +  
+  geom_polygon(data = bivariate_data, aes(x=long, y=lat, group=group, fill = bi_class), color = "grey50", show.legend = FALSE) + 
+  bi_scale_fill(pal = "Brown", dim = 3) +
+  coord_map("conic", lat0 = 30, xlim=c(-90,-80), ylim=c(28,36)) +
+  theme_void() + theme(legend.title.align=0.5) +
+  theme(panel.background = element_rect(fill = '#f0f0f0'),
+        panel.grid.major = element_line(colour = NA)) +
+  labs(x = "Longitude", y = "Latitude", fill = "Child Poverty", 
+       title = "Child poverty and less than high school degree") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+final_map <- ggdraw() +
+  draw_plot(unemploy_pov_map, 0, 0, 1, 1) +
+  draw_plot(legend, 0.25, 0.15, 0.2, 0.35)
+
+final_map
+```
